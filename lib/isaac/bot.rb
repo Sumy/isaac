@@ -1,17 +1,17 @@
-require 'eventmachine'
+require 'socket'
 
 module Isaac
   VERSION = '0.2.1'
 
-  Config = Struct.new(:server, :port, :ssl, :password, :nick, :realname, :version, :environment, :verbose, :encoding)
+  Config = Struct.new(:server, :port, :ssl, :password, :nick, :realname, :version, :environment, :verbose)
 
   class Bot
-    attr_accessor :config, :irc, :nick, :channel, :message, :user, :host, :match,
-      :error
+    attr_accessor :config, :irc, :nick, :channel, :message, :user, :host, :match, :error, :raw_msg, :current_topic
 
     def initialize(&b)
       @events = {}
-      @config = Config.new("localhost", 6667, false, nil, "isaac", "Isaac", 'isaac', :production, false, "utf-8")
+      @current_topic = {}
+      @config = Config.new("localhost", 6667, false, nil, "isaac", "Isaac", 'isaac', :production, false)
 
       instance_eval(&b) if block_given?
     end
@@ -72,7 +72,8 @@ module Isaac
 
     def start
       puts "Connecting to #{@config.server}:#{@config.port}" unless @config.environment == :test
-      @irc = IRC.connect(self, @config)
+      @irc = IRC.new(self, @config)
+      @irc.connect
     end
 
     def message
@@ -81,8 +82,8 @@ module Isaac
 
     def dispatch(event, msg=nil)
       if msg
-        @nick, @user, @host, @channel, @error, @message = 
-          msg.nick, msg.user, msg.host, msg.channel, msg.error, msg.message
+        @nick, @user, @host, @channel, @error, @message, @raw_msg = 
+          msg.nick, msg.user, msg.host, msg.channel, msg.error, msg.message, msg.raw
       end
 
       if handler = find(event, message)
@@ -90,6 +91,22 @@ module Isaac
         self.match = message.match(regexp).captures
         invoke block
       end
+    end
+    
+    def handle_numeric(event, msg)
+      case event.to_s
+      when "332"
+        topic = msg.raw.split(":")[2, msg.raw.split(":").length].join(":")
+        channel = msg.raw.split(":")
+        channel.pop
+        channel = channel.last.split(" ").reject(&:nil?).last
+        
+        set_topic(channel, topic)
+      end
+    end
+    
+    def set_topic(channel, topic)
+      @current_topic[channel] = topic.strip
     end
 
   private
@@ -116,32 +133,44 @@ module Isaac
     end
   end
 
-  class IRC < EventMachine::Connection
-    def self.connect(bot, config)
-      EventMachine.connect(config.server, config.port, self, bot, config)
-    end
-
+  class IRC
     def initialize(bot, config)
       @bot, @config = bot, config
       @transfered = 0
       @registration = []
     end
 
-    def post_init
-      @data = ''
-      @queue = Queue.new(self, @bot.config.server)
+    def connect
+      tcp_socket = TCPSocket.open(@config.server, @config.port)
+
+      if @config.ssl
+        begin
+          require 'openssl'
+        rescue ::LoadError
+          raise(RuntimeError,"unable to require 'openssl'",caller)
+        end
+
+        ssl_context = OpenSSL::SSL::SSLContext.new
+        ssl_context.verify_mode = OpenSSL::SSL::VERIFY_NONE
+
+        unless @config.environment == :test
+          puts "Using SSL with #{@config.server}:#{@config.port}"
+        end
+
+        @socket = OpenSSL::SSL::SSLSocket.new(tcp_socket, ssl_context)
+        @socket.sync = true
+        @socket.connect
+      else
+        @socket = tcp_socket
+      end
+
+      @queue = Queue.new(@socket, @bot.config.server)
       message "PASS #{@config.password}" if @config.password
       message "NICK #{@config.nick}"
       message "USER #{@config.nick} 0 * :#{@config.realname}"
       @queue.lock
-    end
 
-    def receive_data(data)
-      @data << data
-      loop do
-        line, rest = @data.split("\n", 2)
-        return unless rest
-        @data = rest
+      while line = @socket.gets
         parse line
       end
     end
@@ -170,6 +199,8 @@ module Isaac
         message "PONG :#{msg.params.first}"
       elsif msg.command == "PONG"
         @queue.unlock
+      elsif msg.numeric_reply?
+        @bot.handle_numeric(msg.numeric_reply.to_s, msg)
       else
         event = msg.command.downcase.to_sym
         @bot.dispatch(event, msg)
@@ -193,12 +224,12 @@ module Isaac
       parse if msg
     end
 
-    def numeric_reply?
-      !!numeric_reply
+    def numeric_reply
+      @command.match(/^\d\d\d$/).to_s
     end
 
-    def numeric_reply
-      @numeric_reply ||= @command.match(/^\d\d\d$/)
+    def numeric_reply?
+      @numeric_reply ||= !!@command.match(/^\d\d\d$/)
     end
 
     def parse
@@ -212,6 +243,10 @@ module Isaac
       else
         @params = raw_params.split(" ")
       end
+    end
+    
+    def raw
+      @raw
     end
 
     def nick
@@ -267,14 +302,14 @@ module Isaac
     private
     # This is a late night hack. Fix.
     def regular_command?
-      %w(PRIVMSG JOIN PART QUIT).include? command
+      %w(PRIVMSG JOIN PART QUIT TOPIC).include? command
     end
   end
 
   class Queue
-    def initialize(connection, server)
+    def initialize(socket, server)
       # We need  server  for pinging us out of an excess flood
-      @connection, @server = connection, server
+      @socket, @server = socket, server
       @queue, @lock, @transfered = [], false, 0
     end
 
@@ -307,7 +342,7 @@ module Isaac
 
     def lock_and_ping
       lock
-      @connection.send_data "PING :#{@server}\r\n"
+      @socket.print "PING :#{@server}\r\n"
     end
 
     def next_message
@@ -320,7 +355,7 @@ module Isaac
           lock_and_ping; break
         else
           @transfered = transfered_after_next_send
-          @connection.send_data next_message
+          @socket.print next_message
           # puts ">> #{msg}" if @bot.config.verbose
         end
       end
